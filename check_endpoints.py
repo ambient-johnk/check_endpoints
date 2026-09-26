@@ -12,6 +12,20 @@ MAX_WORKERS = 20
 
 # Bare hosts use HTTPS; use http:// for HTTP. Both support :port.
 ENDPOINTS = [
+    "home.ambient.ai",
+    "devices.ambient.ai",
+    "amq.ambient.ai",
+    "signal.ambient.ai",
+    "metrics.ambient.ai",
+    "pushprox.ambient.ai",
+    "registry-1.ambient.ai",
+    "archive.ambient.ai",
+    "downloads.ambient.ai",
+    "gateway.ambient.ai",
+    "kinesis.us-west-2.amazonaws.com",
+    "ssm.us-west-2.amazonaws.com",
+    "sentry.io",
+    "o275180.ingest.us.sentry.io",
     "s3.amazonaws.com",
     "s3.us-west-2.amazonaws.com",
     "ambient-ai-activity-monitor-alert-snapshots-prod.s3.us-west-2.amazonaws.com",
