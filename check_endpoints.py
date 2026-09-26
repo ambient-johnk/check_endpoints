@@ -5,11 +5,12 @@ import socket
 import ssl
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlsplit
 
-PORT = 443
 TIMEOUT = 8
 MAX_WORKERS = 20
 
+# Bare hosts use HTTPS; use http:// for HTTP. Both support :port.
 ENDPOINTS = [
     "s3.amazonaws.com",
     "s3.us-west-2.amazonaws.com",
@@ -48,6 +49,40 @@ SUSPICIOUS_ISSUER_TERMS = [
 ]
 
 
+def parse_endpoint(value):
+    """Read a hostname or HTTP(S) authority; requests always target /."""
+    if not isinstance(value, str) or not value or any(
+        char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value
+    ):
+        raise ValueError("endpoint must be a nonempty string without whitespace")
+    url = urlsplit(value if "://" in value else "https://" + value)
+    if url.scheme not in ("http", "https"):
+        raise ValueError("only HTTP and HTTPS are supported")
+    if url.username is not None or url.password is not None:
+        raise ValueError("URL credentials are not supported")
+    if url.path not in ("", "/") or "?" in value or "#" in value:
+        raise ValueError("use only a hostname and optional port; requests use HEAD /")
+    host = url.hostname
+    if not host or ":" in host:
+        raise ValueError("use an IPv4 address or hostname, not IPv6")
+    host = host.encode("idna").decode("ascii")
+    default_port = 443 if url.scheme == "https" else 80
+    port = url.port
+    if url.netloc.endswith(":"):
+        raise ValueError("a port number is required after ':'")
+    if port is None:
+        port = default_port
+    if not 1 <= port <= 65535:
+        raise ValueError("port must be between 1 and 65535")
+    return {
+        "label": value,
+        "host": host,
+        "scheme": url.scheme,
+        "port": port,
+        "authority": host if port == default_port else f"{host}:{port}",
+    }
+
+
 def name_to_string(name):
     parts = []
 
@@ -74,10 +109,10 @@ def ip_sort_key(ip):
         return (999, 999, 999, 999)
 
 
-def resolve_host(host):
+def resolve_host(host, port):
     addresses = socket.getaddrinfo(
         host,
-        PORT,
+        port,
         family=socket.AF_INET,
         type=socket.SOCK_STREAM,
     )
@@ -91,11 +126,11 @@ def resolve_host(host):
     )
 
 
-def read_http_headers(tls_sock):
+def read_http_headers(connection):
     data = b""
 
     while b"\r\n\r\n" not in data:
-        chunk = tls_sock.recv(4096)
+        chunk = connection.recv(4096)
 
         if not chunk:
             break
@@ -153,10 +188,15 @@ def parse_http_response(response_text):
     return result
 
 
-def check_ip(host, ip):
+def check_ip(endpoint, ip):
+    host = endpoint["host"]
+    port = endpoint["port"]
+    use_tls = endpoint["scheme"] == "https"
     result = {
         "host": host,
         "ip": ip,
+        "port": port,
+        "tls_required": use_tls,
         "tcp": False,
         "tls": False,
         "http": False,
@@ -173,7 +213,7 @@ def check_ip(host, ip):
         # -------------------------------------------------
 
         sock = socket.create_connection(
-            (ip, PORT),
+            (ip, port),
             timeout=TIMEOUT,
         )
 
@@ -188,103 +228,106 @@ def check_ip(host, ip):
         # hostname for SNI and certificate verification.
         # -------------------------------------------------
 
-        context = ssl.create_default_context()
+        if use_tls:
+            context = ssl.create_default_context()
 
-        context.check_hostname = True
-        context.verify_mode = ssl.CERT_REQUIRED
+            context.check_hostname = True
+            context.verify_mode = ssl.CERT_REQUIRED
 
-        tls_sock = context.wrap_socket(
-            sock,
-            server_hostname=host,
-        )
+            tls_sock = context.wrap_socket(
+                sock,
+                server_hostname=host,
+            )
 
-        tls_sock.settimeout(TIMEOUT)
+            tls_sock.settimeout(TIMEOUT)
 
-        result["tls"] = True
-        result["tls_version"] = tls_sock.version()
+            result["tls"] = True
+            result["tls_version"] = tls_sock.version()
 
-        cipher = tls_sock.cipher()
+            cipher = tls_sock.cipher()
 
-        result["cipher"] = (
-            cipher[0]
-            if cipher
-            else "unknown"
-        )
+            result["cipher"] = (
+                cipher[0]
+                if cipher
+                else "unknown"
+            )
 
-        cert = tls_sock.getpeercert()
-        cert_der = tls_sock.getpeercert(
-            binary_form=True
-        )
+            cert = tls_sock.getpeercert()
+            cert_der = tls_sock.getpeercert(
+                binary_form=True
+            )
 
-        result["subject"] = name_to_string(
-            cert.get("subject", [])
-        )
+            result["subject"] = name_to_string(
+                cert.get("subject", [])
+            )
 
-        result["issuer"] = name_to_string(
-            cert.get("issuer", [])
-        )
+            result["issuer"] = name_to_string(
+                cert.get("issuer", [])
+            )
 
-        result["not_before"] = cert.get(
-            "notBefore"
-        )
+            result["not_before"] = cert.get(
+                "notBefore"
+            )
 
-        result["not_after"] = cert.get(
-            "notAfter"
-        )
+            result["not_after"] = cert.get(
+                "notAfter"
+            )
 
-        result["fingerprint"] = (
-            sha256_fingerprint(cert_der)
-        )
+            result["fingerprint"] = (
+                sha256_fingerprint(cert_der)
+            )
 
-        result["sans"] = [
-            value
-            for cert_type, value
-            in cert.get("subjectAltName", [])
-            if cert_type == "DNS"
-        ]
+            result["sans"] = [
+                value
+                for cert_type, value
+                in cert.get("subjectAltName", [])
+                if cert_type == "DNS"
+            ]
+
+            # -------------------------------------------------
+            # Check certificate issuer for obvious signs of
+            # SSL/TLS interception.
+            # -------------------------------------------------
+
+            issuer_lower = result["issuer"].lower()
+
+            for term in SUSPICIOUS_ISSUER_TERMS:
+                if term in issuer_lower:
+                    result["warnings"].append(
+                        "POSSIBLE TLS INTERCEPTION: "
+                        f"issuer contains '{term}'"
+                    )
+
+        connection = tls_sock if use_tls else sock
 
         # -------------------------------------------------
-        # Check certificate issuer for obvious signs of
-        # SSL/TLS interception.
-        # -------------------------------------------------
-
-        issuer_lower = result["issuer"].lower()
-
-        for term in SUSPICIOUS_ISSUER_TERMS:
-            if term in issuer_lower:
-                result["warnings"].append(
-                    "POSSIBLE TLS INTERCEPTION: "
-                    f"issuer contains '{term}'"
-                )
-
-        # -------------------------------------------------
-        # HTTPS request
+        # HTTP(S) request
         #
         # IMPORTANT:
-        # Uses the SAME TLS socket and SAME destination IP
-        # that just completed TLS validation.
+        # Uses the SAME tested connection and destination IP.
+        # HTTPS uses the validated TLS socket.
         # -------------------------------------------------
 
         request = (
             f"HEAD / HTTP/1.1\r\n"
-            f"Host: {host}\r\n"
-            f"User-Agent: S3-Endpoint-Test/3.0\r\n"
+            f"Host: {endpoint['authority']}\r\n"
+            f"User-Agent: Endpoint-Test/4.0\r\n"
             f"Accept: */*\r\n"
             f"Connection: close\r\n"
             f"\r\n"
         )
 
-        tls_sock.sendall(
+        connection.sendall(
             request.encode("ascii")
         )
 
         response_text = read_http_headers(
-            tls_sock
+            connection
         )
 
         if not response_text:
             result["error"] = (
-                "TLS succeeded, but no HTTP "
+                "Connection succeeded, but no HTTP "
                 "response was received"
             )
             return result
@@ -337,15 +380,14 @@ def check_ip(host, ip):
                 "TCP connection timed out"
             )
 
-        elif not result["tls"]:
+        elif use_tls and not result["tls"]:
             result["error"] = (
                 "TLS handshake timed out"
             )
 
         else:
             result["error"] = (
-                "HTTP response timed out "
-                "after TLS succeeded"
+                "HTTP operation timed out after connection succeeded"
             )
 
     except ssl.SSLCertVerificationError as exc:
@@ -398,7 +440,7 @@ def print_ip_result(result):
 
     if (
         result["tcp"]
-        and result["tls"]
+        and (result["tls"] or not result["tls_required"])
         and result["http"]
     ):
         status = "PASS"
@@ -410,13 +452,13 @@ def print_ip_result(result):
     print(f"  Result    : {status}")
 
     print(
-        f"  TCP/{PORT}   : "
+        f"  TCP/{result['port']}   : "
         f"{'PASS' if result['tcp'] else 'FAIL'}"
     )
 
     print(
         f"  TLS       : "
-        f"{'PASS' if result['tls'] else 'FAIL'}"
+        f"{('PASS' if result['tls'] else 'FAIL') if result['tls_required'] else 'N/A (HTTP)'}"
     )
 
     if result["tls"]:
@@ -466,7 +508,7 @@ def print_ip_result(result):
         )
 
         print(
-            f"  HTTPS     : "
+            f"  HTTP      : "
             f"{status_code} {reason}"
         )
 
@@ -503,9 +545,12 @@ def print_ip_result(result):
         )
 
 
-def test_endpoint(host):
+def test_endpoint(endpoint):
+    host = endpoint["host"]
     endpoint_result = {
-        "host": host,
+        "host": endpoint["label"],
+        "scheme": endpoint["scheme"],
+        "port": endpoint["port"],
         "dns": False,
         "ips": [],
         "results": [],
@@ -513,7 +558,7 @@ def test_endpoint(host):
     }
 
     try:
-        ips = resolve_host(host)
+        ips = resolve_host(host, endpoint["port"])
 
         endpoint_result["dns"] = True
         endpoint_result["ips"] = ips
@@ -545,7 +590,7 @@ def test_endpoint(host):
             futures.append(
                 executor.submit(
                     check_ip,
-                    host,
+                    endpoint,
                     ip,
                 )
             )
@@ -572,6 +617,7 @@ def print_endpoint_result(endpoint):
     print()
     print("=" * 100)
     print(endpoint["host"])
+    print(f"Protocol: {endpoint['scheme'].upper()}   Port: {endpoint['port']}")
     print("=" * 100)
 
     if not endpoint["dns"]:
@@ -607,6 +653,7 @@ def summarize(endpoints):
 
     tcp_pass = 0
     tls_pass = 0
+    tls_total = 0
     http_pass = 0
 
     interception_warnings = 0
@@ -666,6 +713,8 @@ def summarize(endpoints):
         )
 
         tcp_pass += endpoint_tcp_pass
+        endpoint_tls_total = sum(r["tls_required"] for r in results)
+        tls_total += endpoint_tls_total
         tls_pass += endpoint_tls_pass
         http_pass += endpoint_http_pass
 
@@ -684,7 +733,7 @@ def summarize(endpoints):
 
             if not (
                 result["tcp"]
-                and result["tls"]
+                and (result["tls"] or not result["tls_required"])
                 and result["http"]
             ):
                 endpoint_failed = True
@@ -695,6 +744,8 @@ def summarize(endpoints):
                         "ip": result["ip"],
                         "tcp": result["tcp"],
                         "tls": result["tls"],
+                        "tls_required": result["tls_required"],
+                        "port": result["port"],
                         "http": result["http"],
                         "error": result.get(
                             "error"
@@ -721,7 +772,7 @@ def summarize(endpoints):
             f"{status:<6} "
             f"{host:<80} "
             f"TCP {endpoint_tcp_pass}/{len(results)}   "
-            f"TLS {endpoint_tls_pass}/{len(results)}   "
+            f"TLS {endpoint_tls_pass}/{endpoint_tls_total}   "
             f"HTTP {endpoint_http_pass}/{len(results)}"
         )
 
@@ -737,7 +788,7 @@ def summarize(endpoints):
     if not failed_paths:
         print(
             "None. All resolved IP paths passed "
-            "TCP, TLS, and HTTP."
+            "TCP, required TLS, and HTTP."
         )
 
     else:
@@ -756,7 +807,7 @@ def summarize(endpoints):
             if not failure["tcp"]:
                 stage = "TCP"
 
-            elif not failure["tls"]:
+            elif failure["tls_required"] and not failure["tls"]:
                 stage = "TLS"
 
             elif not failure["http"]:
@@ -766,12 +817,12 @@ def summarize(endpoints):
                 stage = "UNKNOWN"
 
             print(
-                f"  {failure['ip']:<16} "
+                f"  {failure['ip']}:{failure['port']} "
                 f"FAILED AT: {stage:<5}  "
                 f"TCP="
                 f"{'PASS' if failure['tcp'] else 'FAIL':<4}  "
                 f"TLS="
-                f"{'PASS' if failure['tls'] else 'FAIL':<4}  "
+                f"{('PASS' if failure['tls'] else 'FAIL') if failure['tls_required'] else 'N/A':<4}  "
                 f"HTTP="
                 f"{'PASS' if failure['http'] else 'FAIL':<4}"
             )
@@ -805,7 +856,7 @@ def summarize(endpoints):
                 failure
             )
 
-        elif not failure["tls"]:
+        elif failure["tls_required"] and not failure["tls"]:
             tls_failures.append(
                 failure
             )
@@ -867,13 +918,13 @@ def summarize(endpoints):
     if tcp_failures:
 
         print()
-        print("TCP/443 FAILURES")
+        print("TCP FAILURES")
         print("-" * 120)
 
         for failure in tcp_failures:
 
             print(
-                f"  {failure['ip']:<16} "
+                f"  {failure['ip']}:{failure['port']} "
                 f"{failure['host']}"
             )
 
@@ -896,7 +947,7 @@ def summarize(endpoints):
         for failure in tls_failures:
 
             print(
-                f"  {failure['ip']:<16} "
+                f"  {failure['ip']}:{failure['port']} "
                 f"{failure['host']}"
             )
 
@@ -919,7 +970,7 @@ def summarize(endpoints):
         for failure in http_failures:
 
             print(
-                f"  {failure['ip']:<16} "
+                f"  {failure['ip']}:{failure['port']} "
                 f"{failure['host']}"
             )
 
@@ -954,13 +1005,13 @@ def summarize(endpoints):
     )
 
     print(
-        f"TCP/443 passed            : "
+        f"TCP passed            : "
         f"{tcp_pass}/{total_ips}"
     )
 
     print(
         f"TLS passed                : "
-        f"{tls_pass}/{total_ips}"
+        f"{tls_pass}/{tls_total}"
     )
 
     print(
@@ -993,10 +1044,18 @@ def summarize(endpoints):
 
 
 def main():
+    endpoints = []
+    for value in ENDPOINTS:
+        try:
+            endpoints.append(parse_endpoint(value))
+        except ValueError as exc:
+            print(f"Invalid endpoint {value!r}: {exc}", file=sys.stderr)
+            sys.exit(2)
+
     print()
     print(
-        "S3 Endpoint / Per-IP "
-        "TCP + TLS + HTTPS Test"
+        "Endpoint / Per-IP "
+        "TCP + TLS + HTTP(S) Test"
     )
 
     print("=" * 100)
@@ -1007,8 +1066,7 @@ def main():
     )
 
     print(
-        f"Port        : "
-        f"{PORT}"
+        "Ports       : per endpoint (HTTPS 443 / HTTP 80 defaults)"
     )
 
     print(
@@ -1018,12 +1076,12 @@ def main():
 
     print(
         "TLS checks  : "
-        "system CA trust + hostname/SNI validation"
+        "HTTPS only: system CA trust + hostname/SNI validation"
     )
 
     print(
         "HTTP checks : "
-        "HEAD request over the SAME tested TLS connection"
+        "HEAD / over the SAME tested connection"
     )
 
     endpoint_results = []
@@ -1031,7 +1089,7 @@ def main():
     # Test each endpoint sequentially.
     # All resolved IPs within an endpoint are tested
     # concurrently.
-    for host in ENDPOINTS:
+    for host in endpoints:
 
         result = test_endpoint(
             host
